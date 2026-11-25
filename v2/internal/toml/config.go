@@ -479,6 +479,12 @@ func validateConfig(cfg *config.Config) (*config.Config, error) {
 			user.UIDNumber = user.UnixID
 			log.Info().Msg(fmt.Sprintf("User '%s': 'unixid' is deprecated - please move to 'uidnumber' as per documentation", user.Name))
 		}
+		if user.PassSHA256 != "" {
+			log.Warn().Msg(fmt.Sprintf(
+				"User '%s': 'passsha256' uses a weak, unsalted single-round SHA-256 digest and is deprecated (not recommended); use 'passbcrypt' instead. Successful legacy binds are transparently upgraded when the backend supports it",
+				user.Name,
+			))
+		}
 	}
 	for _, group := range cfg.Groups {
 		if group.UnixID != 0 {

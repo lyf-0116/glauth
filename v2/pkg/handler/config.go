@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,6 +31,11 @@ type configHandler struct {
 	monitor monitoring.MonitorInterface
 	tracer  trace.Tracer
 }
+
+// configUserStateMu protects in-process transparent password upgrades and
+// FindUser's copy of the matching user record. Configuration reloads still use
+// the historical copy semantics and are not made globally atomic by this lock.
+var configUserStateMu sync.RWMutex
 
 // NewConfigHandler creates a new config backed handler
 func NewConfigHandler(opts ...Option) Handler {
@@ -142,6 +148,8 @@ func (h configHandler) FindUser(ctx context.Context, userName string, searchByUP
 	user := config.User{}
 	found := false
 
+	configUserStateMu.RLock()
+	defer configUserStateMu.RUnlock()
 	for _, u := range h.cfg.Users {
 		if searchByUPN {
 			if strings.EqualFold(u.Mail, userName) {
@@ -157,6 +165,50 @@ func (h configHandler) FindUser(ctx context.Context, userName string, searchByUP
 	}
 
 	return found, user, nil
+}
+
+// UpgradePasswordHash replaces the matched in-memory config user's legacy
+// SHA-256 hash. It compare-and-swaps on the values used by Bind so concurrent
+// authentications cannot blindly overwrite a newer record. The on-disk config
+// file is intentionally not rewritten because TOML comments and layout would
+// not be preserved safely; validation warns operators to update the file.
+func (h configHandler) UpgradePasswordHash(_ context.Context, user config.User, bcryptHash string) error {
+	if h.cfg == nil {
+		return fmt.Errorf("configuration backend is not initialized")
+	}
+	if bcryptHash == "" || user.PassSHA256 == "" {
+		return fmt.Errorf("password upgrade requires a legacy hash and a strong hash")
+	}
+
+	configUserStateMu.Lock()
+	defer configUserStateMu.Unlock()
+
+	for index := range h.cfg.Users {
+		current := &h.cfg.Users[index]
+		if !sameConfigUser(*current, user) {
+			continue
+		}
+		if current.PassSHA256 != user.PassSHA256 || current.PassBcrypt != user.PassBcrypt {
+			return ErrPasswordUpgradeConflict
+		}
+		current.PassBcrypt = bcryptHash
+		current.PassSHA256 = ""
+		return nil
+	}
+	return fmt.Errorf("configuration user %q was not found for password upgrade", user.Name)
+}
+
+func sameConfigUser(candidate, wanted config.User) bool {
+	if wanted.UIDNumber != 0 && candidate.UIDNumber == wanted.UIDNumber {
+		return true
+	}
+	if wanted.Name != "" && strings.EqualFold(candidate.Name, wanted.Name) {
+		return true
+	}
+	if wanted.Mail != "" && strings.EqualFold(candidate.Mail, wanted.Mail) {
+		return true
+	}
+	return false
 }
 
 func (h configHandler) FindGroup(ctx context.Context, groupName string) (f bool, g config.Group, err error) {

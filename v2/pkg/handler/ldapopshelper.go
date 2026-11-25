@@ -22,6 +22,7 @@ import (
 
 	"github.com/GeertJohan/yubigo"
 	"github.com/glauth/glauth/v2/pkg/config"
+	"github.com/glauth/glauth/v2/pkg/password"
 	"github.com/glauth/glauth/v2/pkg/stats"
 	"github.com/glauth/ldap"
 	"github.com/pquerna/otp/totp"
@@ -466,27 +467,26 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 		return ldap.LDAPResultInvalidCredentials, nil
 	}
 
-	// Now, check the pasword hash
-	if user.PassBcrypt != "" {
-		decoded, err := hex.DecodeString(user.PassBcrypt)
-		if err != nil {
+	// Select the primary verifier by storage policy rather than letting the
+	// row decide. A strong bcrypt field is authoritative; a legacy SHA-256
+	// field is accepted only when no strong verifier is present and is then
+	// transparently upgraded after successful verification.
+	passwordVerification := password.VerifyPrimaryDetailed(
+		user.PassBcrypt,
+		user.PassSHA256,
+		bindSimplePw,
+	)
+	if !passwordVerification.Valid {
+		if passwordVerification.Malformed {
 			h.GetLog().Info().Str("incorrect stored hash", "(omitted)").Msg("invalid credentials")
 			return ldap.LDAPResultInvalidCredentials, nil
 		}
-		if bcrypt.CompareHashAndPassword(decoded, []byte(bindSimplePw)) != nil {
-			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-			l.maybePutInTimeout(ctx, h, conn, true)
-			return ldap.LDAPResultInvalidCredentials, nil
-		}
+		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
+		l.maybePutInTimeout(ctx, h, conn, true)
+		return ldap.LDAPResultInvalidCredentials, nil
 	}
-	if user.PassSHA256 != "" {
-		hash := sha256.New()
-		hash.Write([]byte(bindSimplePw))
-		if user.PassSHA256 != hex.EncodeToString(hash.Sum(nil)) {
-			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-			l.maybePutInTimeout(ctx, h, conn, true)
-			return ldap.LDAPResultInvalidCredentials, nil
-		}
+	if passwordVerification.Strength == password.WeakStrength {
+		l.upgradeVerifiedPrimaryPassword(ctx, h, *user, bindSimplePw)
 	}
 
 	stats.Frontend.Add("bind_successes", 1)

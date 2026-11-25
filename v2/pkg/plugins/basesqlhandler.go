@@ -98,6 +98,7 @@ func NewDatabaseHandler(sqlBackend SqlBackend, opts ...handler.Option) handler.H
 
 	sqlBackend.CreateSchema(db)
 	sqlBackend.MigrateSchema(db, ColumnExists)
+	migratePasswordHashStorage(db, sqlBackend.GetDriverName(), options.Logger)
 
 	options.Logger.Debug().Msg("Database (" + sqlBackend.GetDriverName() + "::" + options.Backend.Database + ") Plugin: Ready")
 
@@ -109,6 +110,25 @@ func ColumnExists(db *sql.DB, tableName string, columnName string) bool {
 	err := db.QueryRowContext(context.Background(), fmt.Sprintf(`SELECT COUNT(%s) FROM %s`, columnName, tableName)).Scan(
 		&found)
 	return err == nil
+}
+
+// migratePasswordHashStorage widens historical columns that were too short for
+// GLAuth's hex-encoded bcrypt hashes. Failures are non-fatal: the authenticated
+// legacy bind still succeeds, and the transactional upgrade read-back refuses
+// to commit a truncated hash.
+func migratePasswordHashStorage(db *sql.DB, driverName string, logger *zerolog.Logger) {
+	var statement string
+	switch driverName {
+	case "mysql":
+		statement = "ALTER TABLE users MODIFY COLUMN passbcrypt VARCHAR(255) DEFAULT ''"
+	case "postgres":
+		statement = "ALTER TABLE users ALTER COLUMN passbcrypt TYPE TEXT"
+	default:
+		return
+	}
+	if _, err := db.Exec(statement); err != nil && logger != nil {
+		logger.Warn().Err(err).Str("driver", driverName).Msg("unable to widen passbcrypt column for transparent hash upgrades")
+	}
 }
 
 func otlpDriverAttribute(backend SqlBackend) attribute.KeyValue {
@@ -193,12 +213,12 @@ func (h databaseHandler) FindUser(ctx context.Context, userName string, searchBy
 	err = h.database.cnx.QueryRowContext(
 		ctx,
 		fmt.Sprintf(`
-			SELECT u.uidnumber,u.primarygroup,u.passbcrypt,u.passsha256,u.otpsecret,u.yubikey,u.disabled
+			SELECT u.name,u.uidnumber,u.primarygroup,u.passbcrypt,u.passsha256,u.otpsecret,u.yubikey,u.disabled
 			FROM users u WHERE %s=%s`,
 			criterion,
 			h.sqlBackend.GetPrepareSymbol(),
 		), userName).Scan(
-		&user.UIDNumber, &user.PrimaryGroup, &user.PassBcrypt, &user.PassSHA256, &user.OTPSecret, &user.Yubikey, &disabled)
+		&user.Name, &user.UIDNumber, &user.PrimaryGroup, &user.PassBcrypt, &user.PassSHA256, &user.OTPSecret, &user.Yubikey, &disabled)
 	if err == nil {
 		user.Disabled = h.intToBool(disabled)
 		if !user.Disabled {
@@ -226,6 +246,97 @@ func (h databaseHandler) FindUser(ctx context.Context, userName string, searchBy
 	}
 
 	return found, user, err
+}
+
+// UpgradePasswordHash atomically replaces a legacy SHA-256 primary password
+// with a hex-encoded bcrypt hash. The WHERE clause compares the value read
+// during bind, so a concurrent request or administrator change cannot be
+// overwritten blindly. A zero-row result means another writer won the race.
+func (h databaseHandler) UpgradePasswordHash(ctx context.Context, user config.User, bcryptHash string) error {
+	if user.PassSHA256 == "" || bcryptHash == "" {
+		return fmt.Errorf("password upgrade requires a legacy hash and a strong hash")
+	}
+
+	tx, err := h.database.cnx.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	updateQuery := h.rebindPasswordUpgradeQuery(`
+		UPDATE users
+		SET passbcrypt = ?, passsha256 = ''
+		WHERE passsha256 = ?
+		  AND passbcrypt = ''
+		  AND (? = '' OR name = ?)
+		  AND (? = 0 OR uidnumber = ?)
+	`)
+	result, err := tx.ExecContext(
+		ctx,
+		updateQuery,
+		bcryptHash,
+		user.PassSHA256,
+		user.Name,
+		user.Name,
+		user.UIDNumber,
+		user.UIDNumber,
+	)
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected != 1 {
+		// Zero rows is the normal lost CAS race. More than one row means the
+		// identity selected more than one account; neither outcome may commit.
+		return handler.ErrPasswordUpgradeConflict
+	}
+
+	readbackQuery := h.rebindPasswordUpgradeQuery(`
+		SELECT passbcrypt
+		FROM users
+		WHERE (? = '' OR name = ?)
+		  AND (? = 0 OR uidnumber = ?)
+	`)
+	var storedBcrypt string
+	if err := tx.QueryRowContext(
+		ctx,
+		readbackQuery,
+		user.Name,
+		user.Name,
+		user.UIDNumber,
+		user.UIDNumber,
+	).Scan(&storedBcrypt); err != nil {
+		return err
+	}
+	if storedBcrypt != bcryptHash {
+		return fmt.Errorf("strong password hash was not stored verbatim (check passbcrypt column length)")
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h databaseHandler) rebindPasswordUpgradeQuery(query string) string {
+	if h.sqlBackend.GetPrepareSymbol() == "?" {
+		return query
+	}
+
+	var builder strings.Builder
+	parameter := 0
+	for _, r := range query {
+		if r == '?' {
+			parameter++
+			fmt.Fprintf(&builder, "$%d", parameter)
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	return builder.String()
 }
 
 func (h databaseHandler) FindGroup(ctx context.Context, groupName string) (f bool, g config.Group, err error) {

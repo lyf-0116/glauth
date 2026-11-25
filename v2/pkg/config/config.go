@@ -93,8 +93,8 @@ type (
 	User              struct {
 		Name          string
 		OtherGroups   []int
-		PassSHA256    string
-		PassBcrypt    string
+		PassSHA256    string // Deprecated: unsalted single-round SHA-256; binds are upgraded to PassBcrypt when the backend supports it.
+		PassBcrypt    string // Preferred: hex-encoded salted bcrypt hash.
 		PassAppSHA256 []string
 		PassAppBcrypt []string
 		PassAppCustom UserAuthenticator `toml:"-"`
