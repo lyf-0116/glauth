@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/glauth/glauth/v2/internal/monitoring"
+	internaltls "github.com/glauth/glauth/v2/internal/tls"
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/glauth/glauth/v2/pkg/stats"
 	"github.com/glauth/ldap"
@@ -49,6 +49,13 @@ var ownCloudLock sync.Mutex
 func NewOwnCloudHandler(opts ...Option) Handler {
 	options := newOptions(opts...)
 
+	// The minimum version is validated when the config file is loaded, so a
+	// failure here means the handler was wired up with an invalid option.
+	tlsClientConfig, err := internaltls.NewClientConfig(options.TLSMinVersion, options.Backend.Insecure, "")
+	if err != nil {
+		panic(err)
+	}
+
 	return ownCloudHandler{
 		backend:  options.Backend,
 		log:      options.Logger,
@@ -59,9 +66,7 @@ func NewOwnCloudHandler(opts ...Option) Handler {
 				return http.ErrUseLastResponse
 			},
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: options.Backend.Insecure,
-				},
+				TLSClientConfig: tlsClientConfig,
 			},
 		},
 		monitor: options.Monitor,

@@ -10,6 +10,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/GeertJohan/yubigo"
+	internaltls "github.com/glauth/glauth/v2/internal/tls"
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/rs/zerolog/log"
 	"gopkg.in/amz.v3/aws"
@@ -379,6 +380,15 @@ func handleLegacyConfig(cfg *config.Config) (*config.Config, error) {
 	return cfg, nil
 }
 func validateConfig(cfg *config.Config) (*config.Config, error) {
+
+	// The minimum TLS version is a process-wide policy: validate it once at
+	// load time so every listener and outbound connection inherits the same
+	// floor. A zero value is normalized to the package default.
+	minVersion, err := internaltls.ValidateMinVersion(cfg.TLS.MinVersion)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.TLS.MinVersion = minVersion
 
 	if !cfg.LDAP.Enabled && !cfg.LDAPS.Enabled {
 		return cfg, fmt.Errorf("no server configuration found: please provide either LDAP or LDAPS configuration")

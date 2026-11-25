@@ -26,6 +26,9 @@ type Options struct {
 	LDAPHelper LDAPOpsHelper
 	Monitor    monitoring.MonitorInterface
 	Tracer     trace.Tracer
+	// TLSMinVersion is the process-wide minimum TLS version for outbound
+	// connections; zero lets the tls package substitute its default.
+	TLSMinVersion uint16
 }
 
 // newOptions initializes the available default options.
@@ -117,5 +120,13 @@ func Monitor(val monitoring.MonitorInterface) Option {
 func Tracer(val trace.Tracer) Option {
 	return func(o *Options) {
 		o.Tracer = val
+	}
+}
+
+// TLSMinVersion provides a function to set the minimum TLS version used by
+// outbound connections.
+func TLSMinVersion(val uint16) Option {
+	return func(o *Options) {
+		o.TLSMinVersion = val
 	}
 }

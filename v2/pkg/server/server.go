@@ -129,6 +129,7 @@ func NewServer(opts ...Option) (*LdapSvc, error) {
 				handler.Helper(helper),
 				handler.Monitor(s.monitor),
 				handler.Tracer(s.tracer),
+				handler.TLSMinVersion(s.c.TLS.MinVersion),
 			)
 		case "owncloud":
 			h = handler.NewOwnCloudHandler(
@@ -136,6 +137,7 @@ func NewServer(opts ...Option) (*LdapSvc, error) {
 				handler.Logger(&s.log),
 				handler.Monitor(s.monitor),
 				handler.Tracer(s.tracer),
+				handler.TLSMinVersion(s.c.TLS.MinVersion),
 			)
 		case "config":
 			h = handler.NewConfigHandler(

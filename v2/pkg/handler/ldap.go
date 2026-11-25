@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/glauth/glauth/v2/internal/monitoring"
+	internaltls "github.com/glauth/glauth/v2/internal/tls"
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/glauth/glauth/v2/pkg/stats"
 	"github.com/glauth/ldap"
@@ -41,6 +41,8 @@ type ldapHandler struct {
 
 	monitor monitoring.MonitorInterface
 	tracer  trace.Tracer
+	// tlsMinVersion is the policy floor for every upstream LDAPS dial.
+	tlsMinVersion uint16
 }
 
 // global lock for ldapHandler sessions & servers manipulation
@@ -70,16 +72,17 @@ func NewLdapHandler(opts ...Option) Handler {
 	options := newOptions(opts...)
 
 	handler := ldapHandler{ // set non-zero-value defaults here
-		backend:  options.Backend,
-		handlers: options.Handlers,
-		sessions: make(map[string]ldapSession),
-		doPing:   make(chan bool),
-		log:      options.Logger,
-		helper:   options.Helper,
-		lock:     &ldaplock,
-		attm:     ldapattributematcher,
-		monitor:  options.Monitor,
-		tracer:   options.Tracer,
+		backend:       options.Backend,
+		handlers:      options.Handlers,
+		sessions:      make(map[string]ldapSession),
+		doPing:        make(chan bool),
+		log:           options.Logger,
+		helper:        options.Helper,
+		lock:          &ldaplock,
+		attm:          ldapattributematcher,
+		monitor:       options.Monitor,
+		tracer:        options.Tracer,
+		tlsMinVersion: options.TLSMinVersion,
 	}
 	// parse LDAP URLs
 	for _, ldapurl := range handler.backend.Servers {
@@ -474,9 +477,9 @@ func (h ldapHandler) getSession(conn net.Conn) (ldapSession, error) {
 		}
 		dest := fmt.Sprintf("%s:%d", server.Hostname, server.Port)
 		if server.Scheme == "ldaps" {
-			tlsCfg := &tls.Config{}
-			if h.backend.Insecure {
-				tlsCfg.InsecureSkipVerify = true
+			tlsCfg, err := internaltls.NewClientConfig(h.tlsMinVersion, h.backend.Insecure, "")
+			if err != nil {
+				return ldapSession{}, err
 			}
 			l, err = ldap.DialTLS("tcp", dest, tlsCfg)
 		} else if server.Scheme == "ldap" {
@@ -505,9 +508,9 @@ func (h ldapHandler) ping() error {
 		dest := fmt.Sprintf("%s:%d", s.Hostname, s.Port)
 		start := time.Now()
 		if h.servers[0].Scheme == "ldaps" {
-			tlsCfg := &tls.Config{}
-			if h.backend.Insecure {
-				tlsCfg.InsecureSkipVerify = true
+			tlsCfg, tlsErr := internaltls.NewClientConfig(h.tlsMinVersion, h.backend.Insecure, "")
+			if tlsErr != nil {
+				return tlsErr
 			}
 			l, err = ldap.DialTLS("tcp", dest, tlsCfg)
 		} else if h.servers[0].Scheme == "ldap" {

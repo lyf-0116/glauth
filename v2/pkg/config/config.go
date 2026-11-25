@@ -48,18 +48,24 @@ type (
 		TLSKey      string
 		TLSCertPath string
 		TLSKeyPath  string
-		LegacyTLS   bool
 	}
 
 	LDAPS struct {
 		Enabled bool
 		Listen  string
 		// LDAPS TLS parameters
-		Cert      string
-		Key       string
-		CertPath  string
-		KeyPath   string
-		LegacyTLS bool
+		Cert     string
+		Key      string
+		CertPath string
+		KeyPath  string
+	}
+
+	// TLS holds the process-wide TLS policy applied to every listener and
+	// every outbound (LDAP/ownCloud) connection.
+	TLS struct {
+		// MinVersion is the lowest acceptable TLS version, e.g. 0x0303 for
+		// TLS 1.2. A zero value defaults to TLS 1.2 after validation.
+		MinVersion uint16
 	}
 
 	API struct {
@@ -143,6 +149,7 @@ type (
 		Frontend           Frontend
 		LDAP               LDAP
 		LDAPS              LDAPS
+		TLS                TLS
 		Groups             []Group
 		Users              []User
 		Tracing            Tracing
