@@ -127,6 +127,8 @@ func NewServer(opts ...Option) (*LdapSvc, error) {
 				handler.Handlers(allHandlers),
 				handler.Logger(&s.log),
 				handler.Helper(helper),
+				handler.Config(s.c),
+				handler.LDAPHelper(loh),
 				handler.Monitor(s.monitor),
 				handler.Tracer(s.tracer),
 			)
@@ -134,6 +136,8 @@ func NewServer(opts ...Option) (*LdapSvc, error) {
 			h = handler.NewOwnCloudHandler(
 				handler.Backend(backend),
 				handler.Logger(&s.log),
+				handler.Config(s.c),
+				handler.LDAPHelper(loh),
 				handler.Monitor(s.monitor),
 				handler.Tracer(s.tracer),
 			)

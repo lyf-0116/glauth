@@ -84,6 +84,14 @@ func NewDatabaseHandler(sqlBackend SqlBackend, opts ...handler.Option) handler.H
 		cnx:  db,
 	}
 
+	ldohelper := options.LDAPHelper
+	bindFailureStore := handler.NewSQLBindFailureStore(db, sqlBackend.GetDriverName())
+	if err := bindFailureStore.EnsureSchema(context.Background()); err != nil {
+		options.Logger.Error().Err(err).Msg("unable to create shared bind failure table; falling back to local bind counters")
+	} else {
+		ldohelper = ldohelper.WithBindFailureStore(bindFailureStore)
+	}
+
 	handler := databaseHandler{
 		backend:     options.Backend,
 		log:         options.Logger,
@@ -91,7 +99,7 @@ func NewDatabaseHandler(sqlBackend SqlBackend, opts ...handler.Option) handler.H
 		yubikeyAuth: options.YubiAuth,
 		sqlBackend:  sqlBackend,
 		database:    dbInfo,
-		ldohelper:   options.LDAPHelper,
+		ldohelper:   ldohelper,
 		attmatcher:  configattributematcher,
 		tracer:      options.Tracer,
 	}
@@ -193,11 +201,12 @@ func (h databaseHandler) FindUser(ctx context.Context, userName string, searchBy
 	err = h.database.cnx.QueryRowContext(
 		ctx,
 		fmt.Sprintf(`
-			SELECT u.uidnumber,u.primarygroup,u.passbcrypt,u.passsha256,u.otpsecret,u.yubikey,u.disabled
+			SELECT u.name,u.uidnumber,u.primarygroup,u.passbcrypt,u.passsha256,u.otpsecret,u.yubikey,u.disabled
 			FROM users u WHERE %s=%s`,
 			criterion,
 			h.sqlBackend.GetPrepareSymbol(),
 		), userName).Scan(
+		&user.Name,
 		&user.UIDNumber, &user.PrimaryGroup, &user.PassBcrypt, &user.PassSHA256, &user.OTPSecret, &user.Yubikey, &disabled)
 	if err == nil {
 		user.Disabled = h.intToBool(disabled)

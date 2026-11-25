@@ -38,6 +38,8 @@ type ldapHandler struct {
 	servers  []ldapBackend
 	helper   Handler
 	attm     *regexp.Regexp
+	cfg      *config.Config
+	guard    *bindGuard
 
 	monitor monitoring.MonitorInterface
 	tracer  trace.Tracer
@@ -78,6 +80,8 @@ func NewLdapHandler(opts ...Option) Handler {
 		helper:   options.Helper,
 		lock:     &ldaplock,
 		attm:     ldapattributematcher,
+		cfg:      options.Config,
+		guard:    options.LDAPHelper.sharedBindGuard(),
 		monitor:  options.Monitor,
 		tracer:   options.Tracer,
 	}
@@ -111,6 +115,33 @@ func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (result ld
 
 	h.log.Debug().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind request")
 
+	policy := bindLimitPolicyFromConfig(h.cfg)
+	guard := h.guard
+	if guard == nil {
+		guard = newBindGuard(NewMemoryBindFailureStore())
+	}
+	sourceKey := sourceBindKey(bindSourceAddress(conn))
+	if policy.Enabled && !guard.allowed(ctx, sourceKey) {
+		h.log.Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind rejected: source is temporarily blocked")
+		return ldap.LDAPResultUnwillingToPerform, nil
+	}
+
+	normalizedBindDN := strings.ToLower(bindDN)
+	principalKey := principalBindKey(attemptedBindPrincipal(normalizedBindDN, h.backend))
+	defer func() {
+		if !policy.Enabled {
+			return
+		}
+		switch result {
+		case ldap.LDAPResultInvalidCredentials:
+			guard.failure(ctx, policy, sourceKey, principalKey)
+		case ldap.LDAPResultSuccess:
+			if bindDN != "" {
+				guard.reset(ctx, sourceKey, principalKey)
+			}
+		}
+	}()
+
 	//	if h.helper != nil {
 	if true {
 
@@ -140,6 +171,14 @@ func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (result ld
 			h.log.Info().Str("binddn", bindDN).Msg("No local record for bind DN: OTP/YubiKey checks not enforced")
 			validotp = true
 		} else {
+			if user.Name != "" {
+				principalKey = principalBindKey(user.Name)
+			}
+			if policy.Enabled && !guard.allowed(ctx, principalKey) {
+				h.log.Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind rejected: principal is temporarily blocked")
+				return ldap.LDAPResultUnwillingToPerform, nil
+			}
+
 			// A disabled account must never authenticate, on any backend, even
 			// when the upstream password is still valid (GHSA-2wj6-h65w-v37c,
 			// the proxy sibling of the config-backend fix in #470).

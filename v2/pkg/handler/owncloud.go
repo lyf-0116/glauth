@@ -38,6 +38,8 @@ type ownCloudHandler struct {
 	client   *http.Client
 	sessions map[string]ownCloudSession
 	lock     *sync.Mutex
+	cfg      *config.Config
+	guard    *bindGuard
 
 	monitor monitoring.MonitorInterface
 	tracer  trace.Tracer
@@ -66,6 +68,8 @@ func NewOwnCloudHandler(opts ...Option) Handler {
 		},
 		monitor: options.Monitor,
 		tracer:  options.Tracer,
+		cfg:     options.Config,
+		guard:   options.LDAPHelper.sharedBindGuard(),
 	}
 }
 
@@ -90,6 +94,32 @@ func (h ownCloudHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (resul
 
 	bindDN = strings.ToLower(bindDN)
 	baseDN := strings.ToLower("," + h.backend.BaseDN)
+	ctx := context.Background()
+	policy := bindLimitPolicyFromConfig(h.cfg)
+	guard := h.guard
+	if guard == nil {
+		guard = newBindGuard(NewMemoryBindFailureStore())
+	}
+	sourceKey := sourceBindKey(bindSourceAddress(conn))
+	if policy.Enabled && !guard.allowed(ctx, sourceKey) {
+		h.log.Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind rejected: source is temporarily blocked")
+		return ldap.LDAPResultUnwillingToPerform, nil
+	}
+
+	principalKey := principalBindKey(attemptedBindPrincipal(bindDN, h.backend))
+	defer func() {
+		if !policy.Enabled {
+			return
+		}
+		switch result {
+		case ldap.LDAPResultInvalidCredentials:
+			guard.failure(ctx, policy, sourceKey, principalKey)
+		case ldap.LDAPResultSuccess:
+			if bindDN != "" {
+				guard.reset(ctx, sourceKey, principalKey)
+			}
+		}
+	}()
 
 	h.log.Debug().Str("binddn", bindDN).Str("basedn", h.backend.BaseDN).Str("src", conn.RemoteAddr().String()).Msg("Bind request")
 
@@ -106,6 +136,9 @@ func (h ownCloudHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (resul
 		return ldap.LDAPResultInvalidCredentials, nil
 	}
 	userName := strings.TrimPrefix(parts[0], "cn=")
+	if userName != "" {
+		principalKey = principalBindKey(userName)
+	}
 
 	// An empty or non-segment name cannot identify a user; reject before login.
 	if userName == "" || unsafePathSegment(userName) {

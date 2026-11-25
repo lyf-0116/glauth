@@ -317,6 +317,7 @@ type sourceInfo struct {
 type LDAPOpsHelper struct {
 	sources     map[string]*sourceInfo
 	nextPruning time.Time
+	guard       *bindGuard
 
 	tracer trace.Tracer
 }
@@ -325,9 +326,26 @@ func NewLDAPOpsHelper(tracer trace.Tracer) LDAPOpsHelper {
 	helper := LDAPOpsHelper{
 		sources:     make(map[string]*sourceInfo),
 		nextPruning: time.Now(),
+		guard:       newBindGuard(NewMemoryBindFailureStore()),
 		tracer:      tracer,
 	}
 	return helper
+}
+
+// NewLDAPOpsHelperWithBindStore creates a helper whose failure counters are
+// persisted in store. Passing a shared database/cache implementation lets
+// multiple GLAuth replicas enforce the same principal and source limits.
+func NewLDAPOpsHelperWithBindStore(tracer trace.Tracer, store BindFailureStore) LDAPOpsHelper {
+	helper := NewLDAPOpsHelper(tracer)
+	helper.guard = newBindGuard(store)
+	return helper
+}
+
+// WithBindFailureStore returns a helper that shares store while retaining all
+// other helper configuration.
+func (l LDAPOpsHelper) WithBindFailureStore(store BindFailureStore) LDAPOpsHelper {
+	l.guard = newBindGuard(store)
+	return l
 }
 
 func isUnauthenticatedSimpleBind(bindDN, bindSimplePw string) bool {
@@ -338,11 +356,32 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 	ctx, span := l.tracer.Start(ctx, "handler.LDAPOpsHelper.Bind")
 	defer span.End()
 
-	if l.isInTimeout(ctx, h, conn) {
+	policy := bindLimitPolicyFromConfig(h.GetCfg())
+	guard := l.sharedBindGuard()
+	sourceKey := sourceBindKey(l.getAddr(ctx, conn))
+	if policy.Enabled && !guard.allowed(ctx, sourceKey) {
+		h.GetLog().Info().Str("src", conn.RemoteAddr().String()).Msg("Bind rejected: source is temporarily blocked")
 		return ldap.LDAPResultUnwillingToPerform, nil
 	}
 
 	bindDN = strings.ToLower(bindDN)
+	principalKey := principalBindKey(attemptedBindPrincipal(bindDN, h.GetBackend()))
+
+	defer func() {
+		if !policy.Enabled {
+			return
+		}
+		switch resultCode {
+		case ldap.LDAPResultInvalidCredentials:
+			guard.failure(ctx, policy, sourceKey, principalKey)
+		case ldap.LDAPResultSuccess:
+			// Anonymous binds carry no credential and must not clear a
+			// source's failed-attempt counter.
+			if bindDN != "" {
+				guard.reset(ctx, sourceKey, principalKey)
+			}
+		}
+	}()
 
 	h.GetLog().Info().Str("binddn", bindDN).Str("basedn", h.GetBackend().BaseDN).Str("src", conn.RemoteAddr().String()).Msg("Bind request")
 
@@ -359,12 +398,20 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 	// mechanism. It must not establish the named user's authorization state.
 	if isUnauthenticatedSimpleBind(bindDN, bindSimplePw) {
 		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("unauthenticated bind rejected")
+		guard.failure(ctx, policy, sourceKey, principalKey)
 		return ldap.LDAPResultUnwillingToPerform, nil
 	}
 
 	user, ldapcode := l.findUser(ctx, h, bindDN, true /* checkGroup */)
 	if ldapcode != ldap.LDAPResultSuccess {
 		return ldapcode, nil
+	}
+	if user != nil && user.Name != "" {
+		principalKey = principalBindKey(user.Name)
+	}
+	if policy.Enabled && !guard.allowed(ctx, principalKey) {
+		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind rejected: principal is temporarily blocked")
+		return ldap.LDAPResultUnwillingToPerform, nil
 	}
 
 	// a disabled account must never authenticate, on any backend
@@ -462,7 +509,6 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 	// custom authentication return above when they succeed.
 	if user.PassBcrypt == "" && user.PassSHA256 == "" {
 		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-		l.maybePutInTimeout(ctx, h, conn, true)
 		return ldap.LDAPResultInvalidCredentials, nil
 	}
 
@@ -475,7 +521,6 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 		}
 		if bcrypt.CompareHashAndPassword(decoded, []byte(bindSimplePw)) != nil {
 			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-			l.maybePutInTimeout(ctx, h, conn, true)
 			return ldap.LDAPResultInvalidCredentials, nil
 		}
 	}
@@ -484,7 +529,6 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 		hash.Write([]byte(bindSimplePw))
 		if user.PassSHA256 != hex.EncodeToString(hash.Sum(nil)) {
 			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-			l.maybePutInTimeout(ctx, h, conn, true)
 			return ldap.LDAPResultInvalidCredentials, nil
 		}
 	}
@@ -1036,78 +1080,42 @@ func (l LDAPOpsHelper) isInTimeout(ctx context.Context, handler LDAPOpsHandler, 
 	ctx, span := l.tracer.Start(ctx, "handler.LDAPOpsHelper.isInTimeout")
 	defer span.End()
 
-	cfg := handler.GetCfg()
-	if !cfg.Behaviors.LimitFailedBinds {
+	policy := bindLimitPolicyFromConfig(handler.GetCfg())
+	if !policy.Enabled {
 		return false
 	}
 
-	remoteAddr := l.getAddr(ctx, conn)
-	now := time.Now()
-	info, ok := l.sources[remoteAddr]
-	if !ok {
-		l.sources[remoteAddr] = &sourceInfo{
-			lastSeen:  now,
-			failures:  make(chan failedBind, cfg.Behaviors.NumberOfFailedBinds),
-			waitUntil: now,
-		}
-		return false
-	}
-	// update so that this source does not get pruned
-	info.lastSeen = now
-	// if we are in a time out...
-	if cfg.Behaviors.LimitFailedBinds && info.waitUntil.After(now) {
-		return true
-	}
-	return false
+	return !l.sharedBindGuard().allowed(ctx, sourceBindKey(l.getAddr(ctx, conn)))
 }
 
 func (l LDAPOpsHelper) maybePutInTimeout(ctx context.Context, handler LDAPOpsHandler, conn net.Conn, noteFailure bool) bool {
 	ctx, span := l.tracer.Start(ctx, "handler.LDAPOpsHelper.maybePutInTimeout")
 	defer span.End()
 
-	cfg := handler.GetCfg()
-	if !cfg.Behaviors.LimitFailedBinds {
+	policy := bindLimitPolicyFromConfig(handler.GetCfg())
+	if !policy.Enabled || !noteFailure {
 		return false
 	}
 
-	remoteAddr := l.getAddr(ctx, conn)
-	now := time.Now()
-	info, _ := l.sources[remoteAddr]
-	// if we have a failed bind...
-	if noteFailure {
-		info.failures <- failedBind{ts: time.Now()}
-		// if we now have 3 failed binds in a row
-		if len(info.failures) == cfg.Behaviors.NumberOfFailedBinds {
-			// we cannot have more than 3 failed binds in our channel so pop the oldest one
-			pruned := <-info.failures
-			// if we have 3 failed bind in a row in less than 3 seconds
-			if pruned.ts.Add(cfg.Behaviors.PeriodOfFailedBinds * time.Second).After(now) {
-				// we will wait for 'n' seconds no matter what happens next
-				info.waitUntil = time.Now().Add(cfg.Behaviors.BlockFailedBindsFor * time.Second)
-				// purge our failure queue until we resume accepting operations
-				for len(info.failures) > 0 {
-					<-info.failures
-				}
-			}
-		}
-	}
-	// Prune old IPs
-	// TODO We should ensure that the time between prunings is bigger than the time to determine rapid failed binds
-	if l.nextPruning.Before(now) {
-		for sourceIP, sourceInfo := range l.sources {
-			if sourceInfo.lastSeen.Add(cfg.Behaviors.PruneSourcesOlderThan * time.Second).Before(now) {
-				delete(l.sources, sourceIP)
-			}
-		}
-		l.nextPruning = time.Now().Add(cfg.Behaviors.PruneSourceTableEvery * time.Second)
-	}
+	sourceKey := sourceBindKey(l.getAddr(ctx, conn))
+	l.sharedBindGuard().failure(ctx, policy, sourceKey)
 	return false
+}
+
+func (l LDAPOpsHelper) sharedBindGuard() *bindGuard {
+	if l.guard != nil {
+		return l.guard
+	}
+	return newBindGuard(NewMemoryBindFailureStore())
 }
 
 func (l LDAPOpsHelper) getAddr(ctx context.Context, conn net.Conn) string {
 	ctx, span := l.tracer.Start(ctx, "handler.LDAPOpsHelper.getAddr")
 	defer span.End()
+	return bindSourceAddress(conn)
+}
 
+func bindSourceAddress(conn net.Conn) string {
 	fullAddr := conn.RemoteAddr().String()
 	sep := strings.LastIndex(fullAddr, ":")
 	if sep == -1 {
