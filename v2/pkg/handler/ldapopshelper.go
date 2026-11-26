@@ -3,7 +3,10 @@ package handler
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -15,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,6 +34,13 @@ import (
 
 var configattributematcher = regexp.MustCompile(`(?i)\((?P<attribute>[a-zA-Z0-9]+)\s*=\s*(?P<value>.*)\)`)
 var emailmatcher = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
+
+const (
+	saltedSHA256Prefix = "$sha256$v1$"
+	sha256SaltSize     = 16
+)
+
+var zeroValueSourcesMu sync.Mutex
 
 // bindDNCandidate is one way a bind DN may name a user: the value to look up,
 // and whether it should be matched against the user's mail rather than name.
@@ -292,6 +303,77 @@ func bindDNCandidates(backend *config.Backend, bindDN string) []bindDNCandidate 
 	return candidates
 }
 
+// PasswordHashUpdater persists a freshly derived primary password hash for a
+// user. Implementations may reject or fail the write; callers must never let
+// that turn an already verified bind into a failed login.
+type PasswordHashUpdater interface {
+	UpdatePasswordHash(ctx context.Context, user config.User, passwordHash string) error
+}
+
+// saltedSHA256 preserves the historical SHA-256 option while removing its
+// rainbow-table weakness. New values carry their algorithm and version in the
+// stored string so a legacy unsalted digest is distinguishable without
+// rewriting it in place.
+func saltedSHA256(password string, salt []byte) []byte {
+	digest := hmac.New(sha256.New, salt)
+	digest.Write([]byte(password))
+	return digest.Sum(nil)
+}
+
+func newSaltedSHA256Hash(password string) (string, error) {
+	salt := make([]byte, sha256SaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	digest := saltedSHA256(password, salt)
+	return saltedSHA256Prefix + hex.EncodeToString(salt) + "$" + hex.EncodeToString(digest), nil
+}
+
+func legacySHA256Hash(value string) ([]byte, bool) {
+	if len(value) != sha256.Size*2 {
+		return nil, false
+	}
+	digest, err := hex.DecodeString(value)
+	if err != nil || len(digest) != sha256.Size {
+		return nil, false
+	}
+	return digest, true
+}
+
+func verifySHA256Password(value, password string) (matches bool, legacy bool) {
+	if encoded, ok := strings.CutPrefix(value, saltedSHA256Prefix); ok {
+		saltHex, digestHex, ok := strings.Cut(encoded, "$")
+		if !ok {
+			return false, false
+		}
+		salt, err := hex.DecodeString(saltHex)
+		if err != nil || len(salt) == 0 {
+			return false, false
+		}
+		expected, err := hex.DecodeString(digestHex)
+		if err != nil || len(expected) != sha256.Size {
+			return false, false
+		}
+		actual := saltedSHA256(password, salt)
+		return hmac.Equal(actual, expected), false
+	}
+
+	expected, ok := legacySHA256Hash(value)
+	if !ok {
+		return false, false
+	}
+	actual := sha256.Sum256([]byte(password))
+	return subtle.ConstantTimeCompare(actual[:], expected) == 1, true
+}
+
+func verifyBcryptPassword(value, password string) bool {
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword(decoded, []byte(password)) == nil
+}
+
 type LDAPOpsHandler interface {
 	GetBackend() config.Backend
 	GetLog() *zerolog.Logger
@@ -316,15 +398,18 @@ type sourceInfo struct {
 
 type LDAPOpsHelper struct {
 	sources     map[string]*sourceInfo
-	nextPruning time.Time
+	nextPruning *time.Time
 
+	mu     *sync.Mutex
 	tracer trace.Tracer
 }
 
 func NewLDAPOpsHelper(tracer trace.Tracer) LDAPOpsHelper {
+	nextPruning := time.Now()
 	helper := LDAPOpsHelper{
 		sources:     make(map[string]*sourceInfo),
-		nextPruning: time.Now(),
+		nextPruning: &nextPruning,
+		mu:          &sync.Mutex{},
 		tracer:      tracer,
 	}
 	return helper
@@ -369,8 +454,7 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 
 	// a disabled account must never authenticate, on any backend
 	if user.Disabled {
-		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind attempt on disabled account")
-		return ldap.LDAPResultInvalidCredentials, nil
+		return l.invalidCredentials(ctx, h, conn, bindDN, "Bind attempt on disabled account")
 	}
 
 	validotp := false
@@ -414,84 +498,95 @@ func (l LDAPOpsHelper) Bind(ctx context.Context, h LDAPOpsHandler, bindDN, bindS
 	// check app passwords first
 	if user.PassAppBcrypt != nil {
 		for index, appPw := range user.PassAppBcrypt {
-			decoded, err := hex.DecodeString(appPw)
-			if err != nil {
-				h.GetLog().Info().Str("incorrect stored hash", "(omitted)").Msg("invalid app credentials")
-			} else {
-				if bcrypt.CompareHashAndPassword(decoded, []byte(untouchedBindSimplePw)) == nil {
-					stats.Frontend.Add("bind_successes", 1)
-					h.GetLog().Info().Int("index", index).Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind success using app pw")
-					return ldap.LDAPResultSuccess, nil
-				}
+			if verifyBcryptPassword(appPw, untouchedBindSimplePw) {
+				stats.Frontend.Add("bind_successes", 1)
+				h.GetLog().Info().Int("index", index).Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind success using app pw")
+				l.maybePutInTimeout(ctx, h, conn, false)
+				return ldap.LDAPResultSuccess, nil
 			}
+			h.GetLog().Info().Int("index", index).Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Attempt to bind app pw failed")
 		}
 	}
 	if user.PassAppSHA256 != nil {
-		hashFull := sha256.New()
-		hashFull.Write([]byte(untouchedBindSimplePw))
 		for index, appPw := range user.PassAppSHA256 {
-			if appPw != hex.EncodeToString(hashFull.Sum(nil)) {
-				h.GetLog().Info().Int("index", index).Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Attempt to bind app pw failed")
-			} else {
+			if matches, _ := verifySHA256Password(appPw, untouchedBindSimplePw); matches {
 				stats.Frontend.Add("bind_successes", 1)
 				h.GetLog().Info().Int("index", index).Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind success using app pw")
+				l.maybePutInTimeout(ctx, h, conn, false)
 				return ldap.LDAPResultSuccess, nil
 			}
+			h.GetLog().Info().Int("index", index).Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Attempt to bind app pw failed")
 		}
 	}
 	if user.PassAppCustom != nil {
 		err := user.PassAppCustom(user, untouchedBindSimplePw)
 		if err != nil {
-			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Str("error", err.Error()).Msg("Attempt to bind app custom auth failed")
-			return ldap.LDAPResultInvalidCredentials, nil
+			return l.invalidCredentials(ctx, h, conn, bindDN, "Attempt to bind app custom auth failed")
 		}
 
 		stats.Frontend.Add("bind_successes", 1)
 		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind success using app custom auth")
+		l.maybePutInTimeout(ctx, h, conn, false)
 		return ldap.LDAPResultSuccess, nil
 	}
 
 	// Then ensure the OTP is valid before checking
 	if !validotp {
-		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid OTP token")
-		return ldap.LDAPResultInvalidCredentials, nil
+		return l.invalidCredentials(ctx, h, conn, bindDN, "invalid OTP token")
 	}
 
 	// Reaching this point without a configured primary password verifier must
 	// not be treated as successful authentication. App-password matches and
 	// custom authentication return above when they succeed.
 	if user.PassBcrypt == "" && user.PassSHA256 == "" {
-		h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-		l.maybePutInTimeout(ctx, h, conn, true)
-		return ldap.LDAPResultInvalidCredentials, nil
+		return l.invalidCredentials(ctx, h, conn, bindDN, "invalid credentials")
 	}
 
-	// Now, check the pasword hash
-	if user.PassBcrypt != "" {
-		decoded, err := hex.DecodeString(user.PassBcrypt)
-		if err != nil {
-			h.GetLog().Info().Str("incorrect stored hash", "(omitted)").Msg("invalid credentials")
-			return ldap.LDAPResultInvalidCredentials, nil
-		}
-		if bcrypt.CompareHashAndPassword(decoded, []byte(bindSimplePw)) != nil {
-			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-			l.maybePutInTimeout(ctx, h, conn, true)
-			return ldap.LDAPResultInvalidCredentials, nil
-		}
+	matches := false
+	legacySHA256 := false
+	if user.PassBcrypt != "" && verifyBcryptPassword(user.PassBcrypt, bindSimplePw) {
+		matches = true
 	}
 	if user.PassSHA256 != "" {
-		hash := sha256.New()
-		hash.Write([]byte(bindSimplePw))
-		if user.PassSHA256 != hex.EncodeToString(hash.Sum(nil)) {
-			h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("invalid credentials")
-			l.maybePutInTimeout(ctx, h, conn, true)
-			return ldap.LDAPResultInvalidCredentials, nil
+		shaMatches, legacy := verifySHA256Password(user.PassSHA256, bindSimplePw)
+		if shaMatches {
+			matches = true
+			legacySHA256 = legacy
 		}
+	}
+	if !matches {
+		return l.invalidCredentials(ctx, h, conn, bindDN, "invalid credentials")
+	}
+
+	if legacySHA256 {
+		l.upgradeLegacySHA256(ctx, h, *user, bindSimplePw)
 	}
 
 	stats.Frontend.Add("bind_successes", 1)
 	h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Msg("Bind success")
+	l.maybePutInTimeout(ctx, h, conn, false)
 	return ldap.LDAPResultSuccess, nil
+}
+
+func (l LDAPOpsHelper) invalidCredentials(ctx context.Context, h LDAPOpsHandler, conn net.Conn, bindDN, reason string) (ldap.LDAPResultCode, error) {
+	h.GetLog().Info().Str("binddn", bindDN).Str("src", conn.RemoteAddr().String()).Str("reason", reason).Msg("invalid credentials")
+	l.maybePutInTimeout(ctx, h, conn, true)
+	return ldap.LDAPResultInvalidCredentials, nil
+}
+
+func (l LDAPOpsHelper) upgradeLegacySHA256(ctx context.Context, h LDAPOpsHandler, user config.User, password string) {
+	updater, ok := h.(PasswordHashUpdater)
+	if !ok {
+		return
+	}
+	passwordHash, err := newSaltedSHA256Hash(password)
+	if err != nil {
+		h.GetLog().Warn().Err(err).Str("username", user.Name).Msg("Unable to generate upgraded password hash")
+		return
+	}
+	if err := updater.UpdatePasswordHash(ctx, user, passwordHash); err != nil {
+		h.GetLog().Warn().Err(err).Str("username", user.Name).Msg("Unable to store upgraded password hash")
+	}
 }
 
 /*
@@ -1041,13 +1136,19 @@ func (l LDAPOpsHelper) isInTimeout(ctx context.Context, handler LDAPOpsHandler, 
 		return false
 	}
 
+	unlock := l.lockSources()
+	defer unlock()
+
 	remoteAddr := l.getAddr(ctx, conn)
 	now := time.Now()
+	if l.sources == nil {
+		l.sources = make(map[string]*sourceInfo)
+	}
 	info, ok := l.sources[remoteAddr]
 	if !ok {
 		l.sources[remoteAddr] = &sourceInfo{
 			lastSeen:  now,
-			failures:  make(chan failedBind, cfg.Behaviors.NumberOfFailedBinds),
+			failures:  make(chan failedBind, failedBindLimit(cfg.Behaviors.NumberOfFailedBinds)),
 			waitUntil: now,
 		}
 		return false
@@ -1055,7 +1156,7 @@ func (l LDAPOpsHelper) isInTimeout(ctx context.Context, handler LDAPOpsHandler, 
 	// update so that this source does not get pruned
 	info.lastSeen = now
 	// if we are in a time out...
-	if cfg.Behaviors.LimitFailedBinds && info.waitUntil.After(now) {
+	if info.waitUntil.After(now) {
 		return true
 	}
 	return false
@@ -1070,38 +1171,78 @@ func (l LDAPOpsHelper) maybePutInTimeout(ctx context.Context, handler LDAPOpsHan
 		return false
 	}
 
+	unlock := l.lockSources()
+	defer unlock()
+
 	remoteAddr := l.getAddr(ctx, conn)
 	now := time.Now()
-	info, _ := l.sources[remoteAddr]
-	// if we have a failed bind...
+	if l.sources == nil {
+		l.sources = make(map[string]*sourceInfo)
+	}
+	info, ok := l.sources[remoteAddr]
+	if !ok {
+		info = &sourceInfo{lastSeen: now, waitUntil: now}
+		l.sources[remoteAddr] = info
+	}
+	info.lastSeen = now
+
 	if noteFailure {
-		info.failures <- failedBind{ts: time.Now()}
-		// if we now have 3 failed binds in a row
-		if len(info.failures) == cfg.Behaviors.NumberOfFailedBinds {
-			// we cannot have more than 3 failed binds in our channel so pop the oldest one
+		limit := failedBindLimit(cfg.Behaviors.NumberOfFailedBinds)
+		if cap(info.failures) != limit {
+			info.failures = make(chan failedBind, limit)
+		}
+		for len(info.failures) >= limit {
+			<-info.failures
+		}
+		info.failures <- failedBind{ts: now}
+		if len(info.failures) == limit {
 			pruned := <-info.failures
-			// if we have 3 failed bind in a row in less than 3 seconds
 			if pruned.ts.Add(cfg.Behaviors.PeriodOfFailedBinds * time.Second).After(now) {
-				// we will wait for 'n' seconds no matter what happens next
-				info.waitUntil = time.Now().Add(cfg.Behaviors.BlockFailedBindsFor * time.Second)
-				// purge our failure queue until we resume accepting operations
+				info.waitUntil = now.Add(cfg.Behaviors.BlockFailedBindsFor * time.Second)
 				for len(info.failures) > 0 {
 					<-info.failures
 				}
 			}
 		}
+	} else {
+		info.waitUntil = time.Time{}
+		for len(info.failures) > 0 {
+			<-info.failures
+		}
 	}
+
 	// Prune old IPs
 	// TODO We should ensure that the time between prunings is bigger than the time to determine rapid failed binds
-	if l.nextPruning.Before(now) {
+	nextPruning := time.Now()
+	if l.nextPruning != nil {
+		nextPruning = *l.nextPruning
+	}
+	if nextPruning.Before(now) {
 		for sourceIP, sourceInfo := range l.sources {
 			if sourceInfo.lastSeen.Add(cfg.Behaviors.PruneSourcesOlderThan * time.Second).Before(now) {
 				delete(l.sources, sourceIP)
 			}
 		}
-		l.nextPruning = time.Now().Add(cfg.Behaviors.PruneSourceTableEvery * time.Second)
+		next := time.Now().Add(cfg.Behaviors.PruneSourceTableEvery * time.Second)
+		l.nextPruning = &next
 	}
-	return false
+	return info.waitUntil.After(time.Now())
+}
+
+func failedBindLimit(configured int) int {
+	if configured < 1 {
+		return 1
+	}
+	return configured
+}
+
+func (l LDAPOpsHelper) lockSources() func() {
+	mu := l.mu
+	if mu == nil {
+		mu = &zeroValueSourcesMu
+	}
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (l LDAPOpsHelper) getAddr(ctx context.Context, conn net.Conn) string {

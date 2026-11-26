@@ -61,6 +61,25 @@ func (h configHandler) GetYubikeyAuth() *yubigo.YubiAuth {
 	return h.yubikeyAuth
 }
 
+// UpdatePasswordHash upgrades a legacy digest for the in-memory config backend.
+// Static configuration is not written back to disk, but keeping the loaded
+// record current prevents the same password from being rehashed on every bind.
+func (h configHandler) UpdatePasswordHash(_ context.Context, user config.User, passwordHash string) error {
+	if h.cfg == nil {
+		return fmt.Errorf("config backend has no user store")
+	}
+	for i := range h.cfg.Users {
+		candidate := &h.cfg.Users[i]
+		nameMatches := user.Name != "" && strings.EqualFold(candidate.Name, user.Name)
+		mailMatches := user.Mail != "" && strings.EqualFold(candidate.Mail, user.Mail)
+		if nameMatches || mailMatches {
+			candidate.PassSHA256 = passwordHash
+			return nil
+		}
+	}
+	return fmt.Errorf("user %q not found in config backend", user.Name)
+}
+
 // Bind implements a bind request against the config file
 func (h configHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (result ldap.LDAPResultCode, err error) {
 	ctx, span := h.tracer.Start(context.Background(), "handler.configHandler.Bind")

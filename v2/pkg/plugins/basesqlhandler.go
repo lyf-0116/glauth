@@ -193,12 +193,12 @@ func (h databaseHandler) FindUser(ctx context.Context, userName string, searchBy
 	err = h.database.cnx.QueryRowContext(
 		ctx,
 		fmt.Sprintf(`
-			SELECT u.uidnumber,u.primarygroup,u.passbcrypt,u.passsha256,u.otpsecret,u.yubikey,u.disabled
+			SELECT u.name,u.uidnumber,u.primarygroup,u.passbcrypt,u.passsha256,u.otpsecret,u.yubikey,u.disabled
 			FROM users u WHERE %s=%s`,
 			criterion,
 			h.sqlBackend.GetPrepareSymbol(),
 		), userName).Scan(
-		&user.UIDNumber, &user.PrimaryGroup, &user.PassBcrypt, &user.PassSHA256, &user.OTPSecret, &user.Yubikey, &disabled)
+		&user.Name, &user.UIDNumber, &user.PrimaryGroup, &user.PassBcrypt, &user.PassSHA256, &user.OTPSecret, &user.Yubikey, &disabled)
 	if err == nil {
 		user.Disabled = h.intToBool(disabled)
 		if !user.Disabled {
@@ -226,6 +226,24 @@ func (h databaseHandler) FindUser(ctx context.Context, userName string, searchBy
 	}
 
 	return found, user, err
+}
+
+// UpdatePasswordHash replaces a legacy unsalted digest after a successful bind.
+// The write is deliberately separate from authentication; the caller logs a
+// failure but still completes the already verified login.
+func (h databaseHandler) UpdatePasswordHash(ctx context.Context, user config.User, passwordHash string) error {
+	if user.Name == "" {
+		return errors.New("cannot update password hash without a username")
+	}
+	_, err := h.database.cnx.ExecContext(
+		ctx,
+		fmt.Sprintf(`UPDATE users SET passsha256=%s WHERE lower(name)=lower(%s)`,
+			h.sqlBackend.GetPrepareSymbol(),
+			h.sqlBackend.GetPrepareSymbol()),
+		passwordHash,
+		user.Name,
+	)
+	return err
 }
 
 func (h databaseHandler) FindGroup(ctx context.Context, groupName string) (f bool, g config.Group, err error) {
